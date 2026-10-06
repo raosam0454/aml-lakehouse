@@ -1,0 +1,30 @@
+# Generated data. Reproducible from generator/generate_data.py, and large.
+data/
+*.jsonl
+*.jsonl.gz
+ 
+# Credentials and connection config. Never commit these.
+.env
+*.pem
+*.p8
+config.toml
+connections.toml
+snowsql_rt.log*
+ 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+ 
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+ 
+# Scratch
+*.tmp
+*.bak
+scratch/
