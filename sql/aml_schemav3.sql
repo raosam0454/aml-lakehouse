@@ -352,10 +352,16 @@ USE SCHEMA EVALUATION;
 CREATE OR REPLACE TABLE GROUND_TRUTH (
     transaction_id  VARCHAR(20)     NOT NULL,
     pattern_label   VARCHAR(30),        -- normal | structuring | layering_chain
-                                        -- | round_trip | mule_network
+                                        -- | mule_network | round_trip
+                                        -- | round_trip_shared_device
+                                        -- | round_trip_phone_link
+                                        -- | round_trip_sub_threshold
+                                        -- new pattern needs no schema change.
+                                        -- Match all cycle variants with
+                                        -- LIKE 'round_trip%'.
     chain_id        VARCHAR(20),        -- groups transactions of one injected pattern
     hop_index       INT,                -- position within the chain
-
+ 
     CONSTRAINT pk_ground_truth PRIMARY KEY (transaction_id)
 );
 

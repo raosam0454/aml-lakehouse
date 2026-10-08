@@ -16,6 +16,7 @@ Validation runs automatically and the script exits non-zero if it fails.
 """
 
 import argparse
+import bisect
 import gzip
 import json
 import random
@@ -242,6 +243,72 @@ def build_sessions(rng, n, account_ids, devices, ips):
 # Transactions: noise first, then the four injected patterns.
 # =====================================================================
 
+class SessionIndex:
+    """Sessions grouped by account so a transaction can reference a session
+    that actually belongs to the account initiating it.
+
+    Picking a session at random from every session in the dataset attributes
+    almost every transaction to a stranger's login, which breaks any join
+    from TRANSACTION through SESSION to DEVICE or IP_ADDRESS.
+    """
+
+    def __init__(self, sessions):
+        self._by_account = {}
+        for s in sessions:
+            self._add_entry(s)
+        for bucket in self._by_account.values():
+            bucket.sort()
+
+    def _add_entry(self, s):
+        epoch = datetime.strptime(s["session_time"], "%Y-%m-%dT%H:%M:%SZ").timestamp()
+        self._by_account.setdefault(s["account_id"], []).append((epoch, s["session_id"]))
+
+    def add(self, s):
+        """Register a session created after construction, keeping order."""
+        bucket = self._by_account.setdefault(s["account_id"], [])
+        epoch = datetime.strptime(s["session_time"], "%Y-%m-%dT%H:%M:%SZ").timestamp()
+        bisect.insort(bucket, (epoch, s["session_id"]))
+
+    def nearest(self, account_id, when):
+        """The account's session closest in time to `when`, or None if the
+        account has never logged in. A null session is contract-valid and
+        honest: not every payment originates from a digital session."""
+        bucket = self._by_account.get(account_id)
+        if not bucket:
+            return None
+        target = when.timestamp()
+        i = bisect.bisect_left(bucket, (target,))
+        best = None
+        for j in (i - 1, i):
+            if 0 <= j < len(bucket):
+                gap = abs(bucket[j][0] - target)
+                if best is None or gap < best[0]:
+                    best = (gap, bucket[j][1])
+        return best[1] if best else None
+
+
+def attach_shared_sessions(sessions, sidx, sess_counter, account_ids,
+                           device_id, ip_id, t0):
+    """Give a set of accounts a login each from one shared device and IP.
+
+    This is what makes a group detectable by the shared-attribute views,
+    independent of the money flow between them.
+    """
+    for n, acct in enumerate(account_ids):
+        sess_counter[0] += 1
+        s = {
+            "session_id": f"SES-{sess_counter[0]:07d}",
+            "account_id": acct,
+            "device_id": device_id,
+            "ip_id": ip_id,
+            "session_time": iso(t0 + timedelta(hours=n)),
+            "channel": "app",
+            "auth_method": "password",
+        }
+        sessions.append(s)
+        sidx.add(s)
+
+
 class TxnWriter:
     """Accumulates transactions and their ground-truth labels in step."""
 
@@ -278,7 +345,7 @@ class TxnWriter:
         return tid
 
 
-def add_noise(rng, w, n, account_ids, session_ids):
+def add_noise(rng, w, n, account_ids, sidx):
     """Ordinary activity. Cash deposits stay well clear of the TTR threshold
     so that a structuring detector does not fire on normal behaviour."""
     for _ in range(n):
@@ -298,12 +365,12 @@ def add_noise(rng, w, n, account_ids, session_ids):
             a, b = rng.sample(account_ids, 2)
             w.add(account_id=a, counterparty=b, amount=rng.uniform(15, 2_000),
                   when=when, txn_type="direct_debit", channel="netbank",
-                  session=rng.choice(session_ids), description="direct debit")
+                  session=sidx.nearest(a, when), description="direct debit")
         else:
             a, b = rng.sample(account_ids, 2)
             w.add(account_id=a, counterparty=b, amount=rng.uniform(10, 9_000),
                   when=when, txn_type="transfer", channel=rng.choice(DIGITAL_CHANNELS),
-                  session=rng.choice(session_ids), description="transfer")
+                  session=sidx.nearest(a, when), description="transfer")
 
 
 def inject_structuring(rng, w, account_ids, n_chains, chain_no):
@@ -325,7 +392,7 @@ def inject_structuring(rng, w, account_ids, n_chains, chain_no):
                   label="structuring", chain=chain, hop=i)
 
 
-def inject_layering(rng, w, account_ids, session_ids, acct_owner, n_chains, chain_no):
+def inject_layering(rng, w, account_ids, sidx, acct_owner, n_chains, chain_no):
     """A to B to C ... 4 to 8 hops, decaying amounts, short intervals.
     Detected by: recursive CTE. Hops use distinct customers so the
     own-account exclusion in the traversal does not filter the chain out."""
@@ -341,36 +408,113 @@ def inject_layering(rng, w, account_ids, session_ids, acct_owner, n_chains, chai
         for i in range(depth):
             w.add(account_id=hops[i], counterparty=hops[i + 1], amount=amount,
                   when=t, txn_type="transfer", channel=rng.choice(["osko", "payid"]),
-                  session=rng.choice(session_ids), description="transfer",
+                  session=sidx.nearest(hops[i], t), description="transfer",
                   label="layering_chain", chain=chain, hop=i)
             amount *= rng.uniform(0.86, 0.97)
             t += timedelta(hours=rng.randint(2, 20))
 
 
-def inject_round_trip(rng, w, account_ids, session_ids, acct_owner, n_chains, chain_no):
-    """Funds leave an account and return through intermediaries.
-    Detected by: recursive CTE where the path returns to its origin."""
+def inject_round_trip(rng, w, account_ids, sidx, sessions, sess_counter,
+                      acct_owner, cust_by_id, devices, ips, n_chains, chain_no):
+    """Funds leave an account and come back.
+
+    Four mutually exclusive variants, so a ground-truth label identifies
+    exactly one shape. Mutually exclusive rather than combined because an
+    overlapping label cannot be scored cleanly.
+
+      round_trip                 plain cycle closing on the origin account.
+                                 Found by cycle detection alone.
+
+      round_trip_shared_device   cycle whose members also log in from one
+                                 device. Found by cycle detection, and
+                                 corroborated by the shared-device view, so
+                                 it is the case where both signals agree.
+
+      round_trip_phone_link      closes on a DIFFERENT account whose customer
+                                 shares the origin customer's phone number.
+                                 The path never returns to its start, so
+                                 cycle detection misses it entirely and only
+                                 the shared-identity check finds it.
+
+      round_trip_sub_threshold   cycle with every hop between 8,000 and
+                                 9,900, kept under the AUD 10,000 reporting
+                                 threshold.
+    """
+    clean_ips = [p["ip_id"] for p in ips if not p["is_vpn"]]
+    if not clean_ips:
+        clean_ips = [p["ip_id"] for p in ips]
+
     for _ in range(n_chains):
+        roll = rng.random()
+        if roll < 0.40:
+            variant = "shared_device"
+        elif roll < 0.55:
+            variant = "phone_link"
+        elif roll < 0.65:
+            variant = "sub_threshold"
+        else:
+            variant = "plain"
+
         depth = rng.randint(3, 6)
-        hops = pick_distinct_owner_chain(rng, account_ids, acct_owner, depth)
+        # phone_link needs one extra account: the near-miss destination
+        need = depth + 1 if variant == "phone_link" else depth
+        hops = pick_distinct_owner_chain(rng, account_ids, acct_owner, need)
         if not hops:
             continue
-        ring = hops + [hops[0]]
+
+        if variant == "phone_link":
+            # the path ends somewhere else, but that somewhere else is tied
+            # to the origin by a shared phone number
+            ring = hops
+            origin_cust = cust_by_id.get(acct_owner[hops[0]])
+            final_cust = cust_by_id.get(acct_owner[hops[-1]])
+            if not origin_cust or not final_cust:
+                continue
+            final_cust["phone"] = origin_cust["phone"]
+            label = "round_trip_phone_link"
+        else:
+            ring = hops + [hops[0]]
+            label = {
+                "shared_device": "round_trip_shared_device",
+                "sub_threshold": "round_trip_sub_threshold",
+                "plain": "round_trip",
+            }[variant]
+
         chain = f"CHN-{chain_no[0]:06d}"
         chain_no[0] += 1
-        amount = rng.uniform(40_000, 140_000)
         t = rand_dt(rng, span=WINDOW_DAYS - 8)
+
+        if variant == "shared_device":
+            # give the members a login each from one device, a little before
+            # the money starts moving.
+            # phone_link deliberately gets NO shared device, so the phone
+            # number is the only thing tying its accounts together and the
+            # phone branch of an identity cross-check is exercised alone.
+            attach_shared_sessions(
+                sessions, sidx, sess_counter, hops,
+                rng.choice(devices)["device_id"], rng.choice(clean_ips),
+                t - timedelta(hours=len(hops) + 2))
+
+        if variant == "sub_threshold":
+            amount = rng.uniform(8_000, 9_900)
+        else:
+            amount = rng.uniform(40_000, 140_000)
+
         for i in range(depth):
             w.add(account_id=ring[i], counterparty=ring[i + 1], amount=amount,
                   when=t, txn_type="transfer", channel="osko",
-                  session=rng.choice(session_ids), description="transfer",
-                  label="round_trip", chain=chain, hop=i)
-            amount *= rng.uniform(0.95, 0.99)
+                  session=sidx.nearest(ring[i], t), description="transfer",
+                  label=label, chain=chain, hop=i)
+            if variant == "sub_threshold":
+                # stay inside the band rather than decaying out of it
+                amount = rng.uniform(8_000, 9_900)
+            else:
+                amount *= rng.uniform(0.95, 0.99)
             t += timedelta(hours=rng.randint(6, 36))
 
 
-def inject_mule_network(rng, w, customers, accounts, sessions, devices, ips,
-                        account_ids, n_rings, chain_no):
+def inject_mule_network(rng, w, customers, accounts, sessions, sidx, sess_counter,
+                        devices, ips, account_ids, n_rings, chain_no):
     """Recently onboarded customers sharing one device and one non-VPN IP,
     each showing rapid in-and-out. Detected by: V_SHARED_DEVICE_LINK joined
     to recent open_date, plus pass-through timing."""
@@ -384,7 +528,6 @@ def inject_mule_network(rng, w, customers, accounts, sessions, devices, ips,
     if len(recent) < 3 or not clean_ips:
         return
 
-    sess_seq = 9_000_000
     for _ in range(n_rings):
         size = rng.randint(3, 8)
         if len(recent) < size:
@@ -396,23 +539,20 @@ def inject_mule_network(rng, w, customers, accounts, sessions, devices, ips,
         chain_no[0] += 1
         t0 = rand_dt(rng, span=WINDOW_DAYS - 3)
 
-        for n, c in enumerate(ring):
-            acct = by_customer[c["customer_id"]][0]["account_id"]
-            sess_seq += 1
-            sid = f"SES-{sess_seq:07d}"
-            sessions.append({
-                "session_id": sid,
-                "account_id": acct,
-                "device_id": device,
-                "ip_id": ip,
-                "session_time": iso(t0 + timedelta(hours=n)),
-                "channel": "app",
-                "auth_method": "password",
-            })
+        ring_accounts = [by_customer[c["customer_id"]][0]["account_id"] for c in ring]
+        attach_shared_sessions(sessions, sidx, sess_counter, ring_accounts,
+                               device, ip, t0)
+
+        for n, acct in enumerate(ring_accounts):
+            funder = rng.choice(account_ids)
+            t_in = t0 + timedelta(hours=n)
             inflow = rng.uniform(12_000, 28_000)
-            w.add(account_id=rng.choice(account_ids), counterparty=acct,
-                  amount=inflow, when=t0 + timedelta(hours=n),
-                  txn_type="transfer", channel="osko", session=sid,
+            # the session belongs to whoever initiated the payment, which on
+            # the inbound leg is the funder, not the mule
+            w.add(account_id=funder, counterparty=acct,
+                  amount=inflow, when=t_in,
+                  txn_type="transfer", channel="osko",
+                  session=sidx.nearest(funder, t_in),
                   description="transfer", label="mule_network", chain=chain, hop=0)
             w.add(account_id=acct, counterparty=None,
                   amount=inflow * rng.uniform(0.93, 0.99),
@@ -467,6 +607,18 @@ def validate(data):
         if t["session_id"] is not None and t["session_id"] not in ses:
             errors.append(f"TRANSACTION {t['transaction_id']} -> missing session")
 
+    # A transaction's session must belong to the account that initiated it.
+    # Without this, every join from TRANSACTION through SESSION to DEVICE or
+    # IP_ADDRESS attributes activity to the wrong customer.
+    sess_owner = {s["session_id"]: s["account_id"] for s in data["sessions"]}
+    for t in data["transactions"]:
+        if t["session_id"] is None:
+            continue
+        owner = sess_owner.get(t["session_id"])
+        if owner is not None and owner != t["account_id"]:
+            errors.append(f"{t['transaction_id']}: session {t['session_id']} belongs "
+                          f"to {owner}, not initiator {t['account_id']}")
+
         # null rules from data_contract.md
         if t["txn_type"] == "cash_deposit" and t["account_id"] is not None:
             errors.append(f"{t['transaction_id']}: cash_deposit must have null account_id")
@@ -519,8 +671,13 @@ def main():
 
     account_ids = [a["account_id"] for a in accounts]
     acct_owner = {a["account_id"]: a["customer_id"] for a in accounts}
+    cust_by_id = {c["customer_id"]: c for c in customers}
     sessions = build_sessions(rng, cfg["sessions"], account_ids, devices, ip_rows)
-    session_ids = [s["session_id"] for s in sessions]
+
+    # sessions are looked up by account, not picked at random, so a
+    # transaction always references a login that belongs to its initiator
+    sidx = SessionIndex(sessions)
+    sess_counter = [len(sessions)]
 
     target = cfg["transactions"]
     suspicious_budget = int(target * SUSPICIOUS_RATE)
@@ -534,14 +691,15 @@ def main():
     w = TxnWriter()
     chain_no = [1]
 
-    add_noise(rng, w, target - suspicious_budget, account_ids, session_ids)
+    add_noise(rng, w, target - suspicious_budget, account_ids, sidx)
     inject_structuring(rng, w, account_ids, n_structuring, chain_no)
-    inject_layering(rng, w, account_ids, session_ids, acct_owner, n_layering, chain_no)
-    inject_round_trip(rng, w, account_ids, session_ids, acct_owner, n_roundtrip, chain_no)
-    inject_mule_network(rng, w, customers, accounts, sessions, devices, ip_rows,
-                        account_ids, n_mule, chain_no)
+    inject_layering(rng, w, account_ids, sidx, acct_owner, n_layering, chain_no)
+    inject_round_trip(rng, w, account_ids, sidx, sessions, sess_counter,
+                      acct_owner, cust_by_id, devices, ip_rows,
+                      n_roundtrip, chain_no)
+    inject_mule_network(rng, w, customers, accounts, sessions, sidx, sess_counter,
+                        devices, ip_rows, account_ids, n_mule, chain_no)
 
-    # mule injection appends sessions, so refresh the id list before writing
     data = {
         "customers": customers,
         "accounts": accounts,
@@ -573,7 +731,7 @@ def main():
     total = len(w.truth)
     print("\ninjected patterns")
     for k, v in sorted(labels.items(), key=lambda x: -x[1]):
-        print(f"  {k:18s} {v:>9,}  {v / total * 100:5.2f}%")
+        print(f"  {k:26s} {v:>9,}  {v / total * 100:5.2f}%")
     chains = len({t['chain_id'] for t in w.truth if t['chain_id']})
     print(f"\n  distinct chains: {chains}")
     print("validation passed")
