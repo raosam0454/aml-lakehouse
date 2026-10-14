@@ -90,16 +90,102 @@ across unrelated people, and without filtering them the view returns noise.
 
 ## Detection scenarios
 
-| Scenario | Pattern | Technique |
-|---|---|---|
-| Structuring | Cash deposits held under the AUD 10,000 threshold, spread across branches | Window aggregation |
-| Layering chain | Funds moved through 4 to 8 accounts, decaying amounts, short intervals | Recursive CTE |
-| Round-tripping | Funds leaving and returning to the origin through intermediaries | Recursive CTE with cycle termination |
-| Mule network | Recently opened accounts sharing a device, rapid in and out | Shared-attribute views |
+| Scenario | Pattern | Technique | Where |
+|---|---|---|---|
+| Structuring | Cash deposits held under the AUD 10,000 threshold, spread across branches | Window aggregation | structuring query (Bao), not yet wired into `alerts.sql` |
+| Layering chain | Funds moved through 4 to 8 accounts, decaying amounts, short intervals | Recursive CTE | `SERVING.DET_LAYERING` |
+| Round-tripping | Funds leaving and returning to the origin through intermediaries | Recursive CTE with cycle termination + identity cross-check | `SERVING.DET_ROUND_TRIP` |
+| Mule network | Recently opened accounts sharing a device, rapid in and out | Shared device + pass-through behaviour | `SERVING.DET_MULE` |
 
-Each detection query is exposed as a view in `SERVING` with a fixed signature,
-so alert generation reads all four through one union and is unaffected by
-changes inside any individual detector.
+`sql/detection.sql` builds one table per detector in `SERVING`. `sql/alerts.sql`
+reads them through one union into `CURATED.FRAUD_ALERT`, with the evidence for
+each alert (path, transactions, tier, why it was flagged) in `trigger_detail`.
+
+---
+
+## Graph detection
+
+Layering, round-tripping and mule rings are relationship patterns, so they are
+detected as a graph over the curated tables. There is no second engine in the
+pipeline: the graph lives in the lakehouse and is traversed with recursive SQL.
+A Neo4j copy is used only to measure that choice and to draw the rings.
+
+### The graph
+
+| Element | Built from | Table |
+|---|---|---|
+| Money edge (account → account) | completed transfers, one edge per transaction, owners differ | `SERVING.P1_EDGE` |
+| Identity link (account – account) | same phone or email (`CUSTOMER`), same device (`SESSION`) | `SERVING.ACC_LINK` |
+
+One edge per transaction, never aggregated, so every hop keeps its own time and
+amount. Transfers between a customer's own accounts are excluded, otherwise a
+savings-to-offset transfer reads as a hop. IP and address are left out of the
+strong links: carrier NAT, public wifi and shared buildings make them noisy.
+
+### Two patterns that cross-check each other
+
+- **P1, money flow.** Follow the money hop by hop (`SERVING.P1_WALK`). A hop is
+  kept only if it happens after the previous one, within 48 hours, and moves
+  80–100% of the previous amount (the launderer's fee). At most 8 hops, no
+  account revisited. Pruning happens inside the recursion, so the number of
+  paths grows linearly with volume instead of exploding.
+- **P2, shared identity.** Accounts of different customers linked by phone,
+  email or device.
+
+P2 also **closes the loop** for P1. Money rarely returns to the exact origin
+account. It returns to the launderer's other account or a relative's. A path
+counts as a round-trip if it ends on the origin **or on an account linked to the
+origin**.
+
+| Tier | Rule |
+|---|---|
+| high | cycle (P1) and a shared identity (P2): closed through a link, or two members share a phone/email/device |
+| medium | cycle only, or a layering chain |
+
+Rings are de-duplicated by keeping only maximal ones. Inside a ring whose members
+share a device, every sub-path also "closes" on a linked member.
+
+### Results (generator seed 42, small: 50,012 transactions)
+
+`sql/benchmark.sql` compares the detectors with `EVALUATION.GROUND_TRUTH`. A
+chain counts as found only if **one** detection covers all of it.
+
+| Pattern | Chains | Found | Partial | Missed | Tier |
+|---|---|---|---|---|---|
+| round_trip | 6 | 6 | 0 | 0 | medium |
+| round_trip_shared_device | 8 | 8 | 0 | 0 | high |
+| round_trip_phone_link | 5 | 5 | 0 | 0 | high |
+| round_trip_sub_threshold | 4 | 0 | 1 | 3 | — |
+| layering_chain | 15 | 15 | 0 | 0 | medium |
+| mule_network | 9 | 9 | 0 | 0 | — |
+
+False positives: round-trip 0, mule 0, layering 1. 46 alerts in total.
+
+- **phone_link** is the case the cross-check exists for. A strict "returns to the
+  origin" check misses all five; closing the loop through the shared phone finds them.
+- **sub_threshold** is missed because the generator draws a new amount at every
+  hop, so some hops go *up*. That breaks the decaying-amount rule by design of the
+  data, not of the query.
+- A medium-scale check (500,226 transactions, seed 7, same logic run locally)
+  found every injected ring, chain and mule ring, with 0 false positives for rings
+  and mule. Layering false positives rose to 22 of 182: with more volume, random
+  transfers more often form a 4-hop decaying chain by chance. A layering chain on
+  its own is therefore a weaker signal than a closed ring.
+
+### Neo4j comparison
+
+`neo4j/` loads the same curated data, exported with
+`sql/extractNodesAndEdges.sql`, and runs the same detections in Cypher. The results
+match (19 rings, 18 chains, 9 mule rings).
+
+| | Snowflake recursive SQL | Cypher, filter after expansion | Cypher, pruned |
+|---|---|---|---|
+| Rings found | 19 | did not finish | 19 |
+| Time to find rings | ~1.8 s (X-Small) | > 90 s | ~2–3 s (laptop) |
+
+The two engines are not timed on the same hardware. The point is that both need
+pruning during traversal; without it the graph engine does not finish either.
+Details in `neo4j/README.md`.
 
 ---
 
@@ -161,6 +247,25 @@ T_LOAD_RAW ──► T_LOAD_CURATED
 
 Run it on demand with `EXECUTE TASK RAW.T_LOAD_RAW;` to rebuild all tables from
 the staged files in one statement.
+
+### 5. Detect, alert, evaluate
+
+Run in order in a Snowsight worksheet:
+
+```
+sql/detection.sql   ->  SERVING.P1_EDGE, ACC_LINK, P1_WALK, DET_ROUND_TRIP, DET_LAYERING, PASS_THROUGH, DET_MULE
+sql/alerts.sql      ->  CURATED.FRAUD_ALERT + SERVING.V_DASH_* views
+sql/benchmark.sql   ->  EVALUATION.V_BENCHMARK   (the only script that reads GROUND_TRUTH)
+```
+
+### 6. Dashboards
+
+Snowsight Dashboards are deprecated and new ones can no longer be created, so the
+dashboards are a Streamlit in Snowflake app: Projects → Streamlit → + Streamlit App
+(location `AML_PROTOTYPE.SERVING`, warehouse `AML_WH`), paste
+`streamlit/streamlit_app.py`. Three tabs (money rings and layering, shared identity
+and mule rings, alert queue) plus an evaluation tab. The query behind each chart is
+also in `sql/dashboards.sql`.
 
 ---
 
@@ -226,18 +331,22 @@ the views and never the base tables, so there is nothing to bypass.
 
 ```
 sql/
-  aml_schema.sql      database, schemas, roles, tables, views, governance
-  load_sample.sql        stage to raw, raw to curated, verification
-  pipeline.sql    stored procedures and the task DAG
-  detection.sql   the four detection views
-  alerts.sql      alert generation and serving views
+  aml_schemav3.sql          database, schemas, roles, tables, views, governance
+  load_sample.sql           stage to raw, raw to curated, verification
+  detection.sql             graph detection: layering, round-trips (P1 + P2), mule rings
+  alerts.sql                alert generation into FRAUD_ALERT + dashboard views
+  benchmark.sql             detections vs ground truth (EVALUATION)
+  dashboards.sql            the queries behind each dashboard chart
+  extractNodesAndEdges.sql  export of graph nodes and edges for Neo4j
 generator/
-  generate_data.py   synthetic data generator
-docs/
-  data-contract.md   file formats, identifier conventions, injected patterns
-  erd.svg            entity relationship diagram
-  architecture.svg   solution architecture
-  erd.svg            entity relation diagram
+  generate_data.py          synthetic data generator
+streamlit/
+  streamlit_app.py          dashboards (Streamlit in Snowflake)
+neo4j/
+  00-08                     export query, load + Cypher versions of the detections
+  README.md                 graph model, SQL vs Cypher comparison
+extractionCsv/
+  nodes.zip, edges.zip      exported nodes and edges
 ```
 
 ---
@@ -247,7 +356,10 @@ docs/
 | Limitation | Note |
 |---|---|
 | Continuous ingestion is designed but not implemented | Loading runs as scheduled batch rather than streaming |
-| Graph traversal uses recursive SQL | No native graph engine. Performance at depth is measured rather than assumed |
+| Graph traversal uses recursive SQL | No native graph engine. Measured against Neo4j: both need pruning, see Graph detection |
+| Layering alone is a weak signal at volume | False positives rise from 1 to 22 when volume grows 10x; rings and mule stay at 0 |
+| Sub-threshold rings are not detected | The generator re-draws the amount at every hop, so these rings do not decay |
+| Neo4j copy has no cash transactions | The mule check there uses recent onboarding only; cash-out pass-through is checked in Snowflake |
 | Governance uses secure views | Enterprise masking and row access policies were unavailable |
 | Source systems are simulated | Three notional sources with distinct schemas, produced by the generator |
 | Customer nationality is stored but not used in scoring | Jurisdiction of transaction is the appropriate risk key |
