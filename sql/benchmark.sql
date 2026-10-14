@@ -1,13 +1,6 @@
 -- =====================================================================
---  benchmark.sql  -  AML prototype, EVALUATION zone
---
---  Implements:  "Benchmark" box. The ONLY script that reads
---               EVALUATION.GROUND_TRUTH. Compares detector output
---               (SERVING.DET_*) with the generator's labels.
---
---  Per injected chain: found_full = every transaction of the chain is in
---  one detection; found_partial = some; missed = none.
---  false_positive = detections containing no injected transaction.
+--  benchmark.sql : detections vs EVALUATION.GROUND_TRUTH (the only script
+--  that reads it). A chain counts as found only if one detection covers it.
 -- =====================================================================
 
 USE ROLE ACCOUNTADMIN;
@@ -23,7 +16,7 @@ rt_txn AS (
 ly_txn AS (
     SELECT l.path_key, l.tier, f.value::VARCHAR AS transaction_id
     FROM   SERVING.DET_LAYERING l, LATERAL FLATTEN(input => l.txn_ids) f),
--- mule: injected members are the receiving accounts of hop 0
+-- injected mule members
 mule_gt AS (
     SELECT DISTINCT g.chain_id, t.counterparty_account_id AS account_id
     FROM   EVALUATION.GROUND_TRUTH g
@@ -32,13 +25,13 @@ mule_gt AS (
 mule_found AS (
     SELECT m.device_id, f.value::VARCHAR AS account_id
     FROM   SERVING.DET_MULE m, LATERAL FLATTEN(input => m.accounts) f),
--- structuring: injected chains and their target account (deposits go INTO it)
+-- injected structuring accounts
 structuring_gt AS (
     SELECT DISTINCT g.chain_id, t.counterparty_account_id AS account_id
     FROM   EVALUATION.GROUND_TRUTH g
     JOIN   CURATED.TRANSACTION t ON t.transaction_id = g.transaction_id
     WHERE  g.pattern_label = 'structuring'),
--- every detection (ring or layering chain) with its transactions
+-- all ring / layering detections with their transactions
 det_txn AS (
     SELECT 'R:' || path_key AS det_id, tier, transaction_id FROM rt_txn
     UNION ALL
@@ -47,8 +40,7 @@ gt_chain AS (
     SELECT pattern_label, chain_id, transaction_id
     FROM   EVALUATION.GROUND_TRUTH
     WHERE  pattern_label LIKE 'round_trip%' OR pattern_label = 'layering_chain'),
--- how much of each injected chain ONE detection covers (a chain split into two
--- fragments by two different detections is "partial", not "full")
+-- best coverage of each injected chain by a single detection
 chain_det AS (
     SELECT g.chain_id, d.det_id, d.tier, COUNT(*) AS hit_txn
     FROM   gt_chain g JOIN det_txn d ON d.transaction_id = g.transaction_id
@@ -72,7 +64,7 @@ chains AS (
     LEFT JOIN mule_found mf ON mf.account_id = mg.account_id
     GROUP BY 2
     UNION ALL
-    -- structuring is account-level: a chain is found if its target account is flagged
+    -- structuring: found if the target account is flagged
     SELECT 'structuring', sg.chain_id, 1, IFF(MAX(ds.account_id) IS NOT NULL, 1, 0), NULL
     FROM   structuring_gt sg
     LEFT JOIN SERVING.DET_STRUCTURING ds ON ds.account_id = sg.account_id

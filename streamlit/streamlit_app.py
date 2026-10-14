@@ -1,18 +1,9 @@
-# =====================================================================
-#  aml_dashboard.py  -  Streamlit in Snowflake app (AML prototype)
-#
-#  Implements: "Consumption / dashboards" box of the solution architecture.
-#  Snowsight Dashboards are deprecated, so the 3 dashboards are built as one
-#  Streamlit app with 3 tabs (+ an evaluation tab). Reads SERVING views and
-#  CURATED.FRAUD_ALERT produced by detection.sql + alerts.sql.
-#
-#  Create in Snowsight: Projects -> Streamlit -> + Streamlit App,
-#  location AML_PROTOTYPE.SERVING, warehouse AML_WH, paste this file, Run.
-# =====================================================================
+# streamlit_app.py : AML dashboards (Streamlit in Snowflake)
+# Reads the SERVING views and CURATED.FRAUD_ALERT built by detection.sql + alerts.sql.
+
 import pandas as pd
 import streamlit as st
 
-# Works on both Streamlit-in-Snowflake runtimes (warehouse and container)
 try:
     from snowflake.snowpark.context import get_active_session
     session = get_active_session()
@@ -42,9 +33,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
     ["1 · Money rings & layering (P1)", "2 · Shared identity & mule (P2)",
      "3 · Alert queue", "4 · Detection quality (evaluation)"])
 
-# ---------------------------------------------------------------------
-# Dashboard 1: money rings and layering chains (P1)
-# ---------------------------------------------------------------------
+# Dashboard 1: money rings and layering chains
 with tab1:
     rings = q("""SELECT alert_id, tier, closed_by, hops, path,
                         first_amount, last_amount, decay_pct
@@ -69,12 +58,12 @@ with tab1:
     st.dataframe(rings.sort_values(["TIER", "HOPS"], ascending=[True, False]),
                  use_container_width=True, hide_index=True)
 
-    # draw one ring as a graph: money edges + the identity link that closes / ties it
+    # draw one ring: money edges + identity links
     st.subheader("Look at one ring")
     ring_ids = q("""SELECT alert_id FROM AML_PROTOTYPE.CURATED.FRAUD_ALERT
                     WHERE alert_type = 'round_trip' ORDER BY fraud_score DESC, alert_id""")["ALERT_ID"].tolist()
     if ring_ids:
-        chosen = st.selectbox("Ring", ring_ids)          # value comes from our own alert list
+        chosen = st.selectbox("Ring", ring_ids)
         edges = q(f"""
             SELECT e.src, e.dst, e.amount, TO_CHAR(e.txn_time, 'DD Mon HH24:MI') AS ts
             FROM   AML_PROTOTYPE.SERVING.P1_EDGE e
@@ -101,9 +90,7 @@ with tab1:
         st.graphviz_chart("\n".join(dot))
         st.caption("Solid arrows = money (amount, time). Dashed = shared phone / email / device (P2).")
 
-# ---------------------------------------------------------------------
-# Dashboard 2: shared identity and mule rings (P2)
-# ---------------------------------------------------------------------
+# Dashboard 2: shared identity and mule rings
 with tab2:
     links_by_type = q("""SELECT via, COUNT(*) / 2 AS pairs
                          FROM AML_PROTOTYPE.SERVING.ACC_LINK GROUP BY via""")
@@ -127,9 +114,7 @@ with tab2:
     st.dataframe(mule.sort_values("N_CUSTOMERS", ascending=False),
                  use_container_width=True, hide_index=True)
 
-# ---------------------------------------------------------------------
-# Dashboard 3: alert queue for investigators
-# ---------------------------------------------------------------------
+# Dashboard 3: alert queue
 with tab3:
     queue = q("""SELECT alert_id, alert_type, fraud_score, account_id,
                         trigger_detail:tier::VARCHAR      AS tier,
@@ -158,10 +143,7 @@ with tab3:
                  .sort_values(["FRAUD_SCORE", "ALERT_ID"], ascending=[False, True]),
                  use_container_width=True, hide_index=True)
 
-# ---------------------------------------------------------------------
-# Evaluation (reads EVALUATION.V_BENCHMARK, i.e. the ground truth).
-# Kept in its own tab: this is test evidence, not part of the AML solution.
-# ---------------------------------------------------------------------
+# Evaluation: detections vs ground truth
 with tab4:
     st.caption("Compares detections with the generator's labels (EVALUATION.GROUND_TRUTH). "
                "Detection queries never read this table.")
