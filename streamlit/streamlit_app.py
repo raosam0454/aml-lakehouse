@@ -145,6 +145,12 @@ with tab3:
     st.subheader("Alerts by type and tier")
     st.bar_chart(summary.pivot(index="ALERT_TYPE", columns="TIER", values="ALERTS").fillna(0))
 
+    st.subheader("Structuring: cash deposits split under the AUD 10,000 threshold")
+    struct = q("""SELECT account_id, n_days, n_deposits, total_amount, n_branches, first_day, last_day
+                    FROM AML_PROTOTYPE.SERVING.DET_STRUCTURING""")
+    st.dataframe(struct.sort_values("TOTAL_AMOUNT", ascending=False),
+                 use_container_width=True, hide_index=True)
+
     st.subheader("Alert queue (highest score first)")
     types = st.multiselect("Type", sorted(queue["ALERT_TYPE"].unique()),
                            default=sorted(queue["ALERT_TYPE"].unique()))

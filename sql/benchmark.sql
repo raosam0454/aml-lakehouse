@@ -32,6 +32,12 @@ mule_gt AS (
 mule_found AS (
     SELECT m.device_id, f.value::VARCHAR AS account_id
     FROM   SERVING.DET_MULE m, LATERAL FLATTEN(input => m.accounts) f),
+-- structuring: injected chains and their target account (deposits go INTO it)
+structuring_gt AS (
+    SELECT DISTINCT g.chain_id, t.counterparty_account_id AS account_id
+    FROM   EVALUATION.GROUND_TRUTH g
+    JOIN   CURATED.TRANSACTION t ON t.transaction_id = g.transaction_id
+    WHERE  g.pattern_label = 'structuring'),
 -- every detection (ring or layering chain) with its transactions
 det_txn AS (
     SELECT 'R:' || path_key AS det_id, tier, transaction_id FROM rt_txn
@@ -65,6 +71,12 @@ chains AS (
     FROM   mule_gt mg
     LEFT JOIN mule_found mf ON mf.account_id = mg.account_id
     GROUP BY 2
+    UNION ALL
+    -- structuring is account-level: a chain is found if its target account is flagged
+    SELECT 'structuring', sg.chain_id, 1, IFF(MAX(ds.account_id) IS NOT NULL, 1, 0), NULL
+    FROM   structuring_gt sg
+    LEFT JOIN SERVING.DET_STRUCTURING ds ON ds.account_id = sg.account_id
+    GROUP BY 2
 ),
 recall AS (
     SELECT pattern_label,
@@ -94,6 +106,11 @@ fp AS (
     FROM  (SELECT mf.device_id, COUNT(mg.account_id) AS inj
            FROM mule_found mf LEFT JOIN mule_gt mg ON mg.account_id = mf.account_id
            GROUP BY mf.device_id) WHERE inj = 0
+    UNION ALL
+    SELECT 'structuring (detector)', COUNT(*)
+    FROM   SERVING.DET_STRUCTURING ds
+    LEFT JOIN structuring_gt sg ON sg.account_id = ds.account_id
+    WHERE  sg.account_id IS NULL
 )
 SELECT pattern_label, chains, found_full, found_partial, missed, tiers, NULL AS false_positives FROM recall
 UNION ALL

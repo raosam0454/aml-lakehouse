@@ -16,9 +16,8 @@
 --    SERVING.PASS_THROUGH    accounts that receive money and send >=90% out in 24h
 --    SERVING.DET_MULE        P2 mule rings: >=3 customers on one device, recent
 --                            accounts, pass-through behaviour
---
---  Structuring (cash deposits under the TTR threshold) is a separate,
---  non-graph detector (window aggregation) - see BaoTest.sql.
+--    SERVING.DET_STRUCTURING cash deposits split under the TTR threshold
+--                            (non-graph, window aggregation; logic by Duy Bao Cao)
 --
 --  Never reads EVALUATION.GROUND_TRUTH.
 --
@@ -248,12 +247,54 @@ HAVING COUNT(DISTINCT customer_id) >= 3;
 
 
 -- ---------------------------------------------------------------------
--- 7. Quick check (expected on generator seed 42 / small, 50,012 txns):
---    round-trips 19 (13 high, 6 medium), layering ~18, mule rings 9
+-- 7. Structuring (placement stage, not a graph pattern; logic by Duy Bao Cao).
+--    Cash deposits just under the AUD 10,000 TTR threshold. A day is
+--    suspicious when an account receives >= 2 such deposits totalling
+--    >= 10,000 (the deposits were split to stay under the threshold).
+--    One row per account, summarising all its suspicious days.
 -- ---------------------------------------------------------------------
-SELECT 'round_trip' AS detector, tier, COUNT(*) AS n FROM DET_ROUND_TRIP GROUP BY tier
+CREATE OR REPLACE TABLE DET_STRUCTURING AS
+WITH deposits AS (
+    SELECT transaction_id,
+           counterparty_account_id AS account_id,       -- cash deposit: money goes INTO this account
+           txn_time::DATE          AS day,
+           amount,
+           branch_code
+    FROM   CURATED.TRANSACTION
+    WHERE  txn_type = 'cash_deposit'
+      AND  status   = 'completed'
+      AND  amount BETWEEN 7000 AND 9999.99
+),
+flagged_days AS (
+    SELECT account_id, day
+    FROM   deposits
+    GROUP BY account_id, day
+    HAVING COUNT(*) >= 2 AND SUM(amount) >= 10000
+)
+SELECT d.account_id,
+       COUNT(DISTINCT d.day)            AS n_days,
+       COUNT(*)                         AS n_deposits,
+       SUM(d.amount)                    AS total_amount,
+       COUNT(DISTINCT d.branch_code)    AS n_branches,
+       MIN(d.day)                       AS first_day,
+       MAX(d.day)                       AS last_day,
+       ARRAY_AGG(d.transaction_id)      AS txn_ids,
+       'medium'                         AS tier
+FROM   deposits d
+JOIN   flagged_days f ON f.account_id = d.account_id AND f.day = d.day
+GROUP BY d.account_id;
+
+
+-- ---------------------------------------------------------------------
+-- 8. Quick check (expected on generator seed 42 / small, 50,012 txns):
+--    round-trips 19 (13 high, 6 medium), layering ~18, mule rings 9,
+--    structuring 9
+-- ---------------------------------------------------------------------
+SELECT 'round_trip' AS detector, tier, COUNT(*) AS n FROM DET_ROUND_TRIP  GROUP BY tier
 UNION ALL
-SELECT 'layering',   tier, COUNT(*) FROM DET_LAYERING  GROUP BY tier
+SELECT 'layering',    tier, COUNT(*) FROM DET_LAYERING    GROUP BY tier
 UNION ALL
-SELECT 'mule',       tier, COUNT(*) FROM DET_MULE      GROUP BY tier
+SELECT 'mule',        tier, COUNT(*) FROM DET_MULE        GROUP BY tier
+UNION ALL
+SELECT 'structuring', tier, COUNT(*) FROM DET_STRUCTURING GROUP BY tier
 ORDER BY detector, tier;

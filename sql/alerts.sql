@@ -79,6 +79,24 @@ FROM (
                'n_customers',  n_customers,
                'accounts',     accounts)
     FROM   SERVING.DET_MULE
+
+    UNION ALL
+
+    -- structuring: one alert per account receiving split cash deposits
+    SELECT account_id,
+           txn_ids[0]::VARCHAR,
+           'structuring',
+           60,
+           OBJECT_CONSTRUCT(
+               'tier',         tier,
+               'n_days',       n_days,
+               'n_deposits',   n_deposits,
+               'total_amount', total_amount,
+               'n_branches',   n_branches,
+               'first_day',    first_day,
+               'last_day',     last_day,
+               'txn_ids',      txn_ids)
+    FROM   SERVING.DET_STRUCTURING
 );
 
 
