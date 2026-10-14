@@ -64,3 +64,8 @@ ORDER BY fraud_score DESC, alert_id;
 SELECT pattern_label, chains, found_full, found_partial, missed, tiers, false_positives
 FROM   AML_PROTOTYPE.EVALUATION.V_BENCHMARK
 ORDER BY pattern_label;
+
+-- 3e structuring accounts
+SELECT account_id, n_days, n_deposits, total_amount, n_branches, first_day, last_day
+FROM   AML_PROTOTYPE.SERVING.DET_STRUCTURING
+ORDER BY total_amount DESC;
