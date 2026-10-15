@@ -13,7 +13,8 @@ WHERE all(i IN range(0, size(rs)-2) WHERE
 WITH [x IN rs | x.txn_id] AS txns,
      e = a
      OR EXISTS { (a)<-[:OWNS]-(:Customer)-[:HAS_CONTACT]->(k:Contact)<-[:HAS_CONTACT]-(:Customer)-[:OWNS]->(e) WHERE k.kind IN ['phone','email'] }
-     OR EXISTS { (a)-[:USED_DEVICE]->(:Device)<-[:USED_DEVICE]-(e) } AS closes
+     OR EXISTS { (a)-[:USED_DEVICE]->(:Device)<-[:USED_DEVICE]-(e),
+                 (a)<-[:OWNS]-(c1:Customer), (e)<-[:OWNS]-(c2:Customer) WHERE c1 <> c2 } AS closes
 WITH collect({txns: txns, closes: closes}) AS paths
 WITH paths, [q IN paths WHERE q.closes | q.txns] AS rings
 UNWIND paths AS q

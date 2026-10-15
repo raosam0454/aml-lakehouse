@@ -16,6 +16,7 @@ and to visualise the rings.
 ```
 One `SENT_TO` per transaction (never aggregated), so every hop keeps its own time and amount.
 Shared attributes are nodes (`Contact`, `Device`, `IP`), so "shares a phone" is a 2-hop pattern.
+As in `ACC_LINK` (SQL), an identity link only counts between accounts of different customers.
 
 ## Files
 | File | Purpose |
@@ -25,10 +26,11 @@ Shared attributes are nodes (`Contact`, `Device`, `IP`), so "shares a phone" is 
 | 02_p1_naive_video_style.cypher | Cycle query that filters only after expanding whole paths. **Did not finish in 90 s** |
 | 03_p1_cycles_pruned.cypher | Cycles closing on the origin, pruned during expansion (anchored on the first hop) |
 | 04_p1p2_rings_tiers.cypher | P1 + P2: rings closing on the origin or on an identity-linked account, tiered, de-duplicated |
-| 05_visualise_high_rings.cypher | Neo4j Browser picture of high rings (shared device / shared phone) |
+| 05_visualise_high_rings.cypher | Neo4j Browser picture of the 13 high rings with their identity evidence |
 | 06_layering.cypher | Open chains of 4+ hops, maximal, excluding rings |
 | 07_mule.cypher | Devices shared by 3+ recently onboarded customers |
-| 08_visual_examples.cypher | Pictures: one phone-linked ring, one mule ring, one plain cycle |
+| 08_visual_examples.cypher | Pictures for slides: one phone-linked ring, one mule ring, one plain (medium) cycle |
+| 09_all_rings_graph.cypher | Neo4j Browser picture of all 19 rings with their identity evidence |
 
 ## Results (generator seed 42, small: 50,012 transactions)
 | | Snowflake SQL | Cypher (naive) | Cypher (pruned) |

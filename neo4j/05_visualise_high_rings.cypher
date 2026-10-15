@@ -1,29 +1,30 @@
-// Paste into Neo4j Browser (http://localhost:7474) to SEE the high-risk rings as a graph.
-// Shows: money cycle (SENT_TO) + the shared device / shared phone that links its members.
-// High = cycle (P1) AND a shared identity (P2): members share a device, or the money
-// returns to a different account whose owner shares the origin owner's phone.
-
-// 1. money path from origin a, first hop r0, then 2-7 more hops ending at e (coarse pruning)
+// Neo4j Browser picture of the HIGH rings only (13): money cycle (P1) plus the shared identity (P2)
+// that confirms it - the phone/email link that closes the loop, or members sharing a device/contact.
 MATCH (a:Account)-[r0:SENT_TO]->(b:Account)
 MATCH p = (b) ((x:Account)-[r:SENT_TO]->(y:Account)
               WHERE r.ts > r0.ts AND r.ts <= r0.ts + duration('P14D')
                 AND r.amount <= r0.amount AND r.amount >= 0.2 * r0.amount){2,7} (e:Account)
-// 2. closes on the origin, or on an account whose owner shares the origin owner's phone
 WHERE e = a
-   OR EXISTS { (a)<-[:OWNS]-(:Customer)-[:HAS_CONTACT]->(k:Contact)<-[:HAS_CONTACT]-(:Customer)-[:OWNS]->(e) WHERE k.kind = 'phone' }
-// 3. exact P1 rule on every pair of consecutive hops
-WITH a, b, r0, p, e, [r0] + relationships(p) AS rs
+   OR EXISTS { (a)<-[:OWNS]-(:Customer)-[:HAS_CONTACT]->(k:Contact)<-[:HAS_CONTACT]-(:Customer)-[:OWNS]->(e) WHERE k.kind IN ['phone','email'] }
+   OR EXISTS { (a)-[:USED_DEVICE]->(:Device)<-[:USED_DEVICE]-(e),
+                  (a)<-[:OWNS]-(c1:Customer), (e)<-[:OWNS]-(c2:Customer) WHERE c1 <> c2 }
+WITH a, r0, p, e, [r0] + relationships(p) AS rs
 WHERE all(i IN range(0, size(rs)-2) WHERE
       rs[i+1].ts > rs[i].ts AND rs[i+1].ts <= rs[i].ts + duration('PT48H') AND
       rs[i+1].amount <= rs[i].amount AND rs[i+1].amount >= 0.8 * rs[i].amount)
-// 4. P2 evidence inside the ring: pairs of members sharing a device
-OPTIONAL MATCH dev = (m1:Account)-[:USED_DEVICE]->(:Device)<-[:USED_DEVICE]-(m2:Account)
-WHERE m1 IN nodes(p) + [a] AND m2 IN nodes(p) + [a] AND elementId(m1) < elementId(m2)
-WITH a, b, r0, p, e, collect(dev) AS devs
-// 5. keep HIGH rings only: shared device inside, or closed through a shared phone
-WHERE size(devs) > 0 OR e <> a
-WITH a, b, r0, p, e, devs LIMIT 6
-// 6. the phone link (only for rings that closed on a different account)
-OPTIONAL MATCH link = (a)<-[:OWNS]-(:Customer)-[:HAS_CONTACT]->(:Contact {kind:'phone'})<-[:HAS_CONTACT]-(:Customer)-[:OWNS]->(e)
-WHERE e <> a
-RETURN a, r0, b, p, devs, link;
+// keep only maximal rings
+WITH collect({a: a, r0: r0, p: p, e: e, txns: [x IN rs | x.txn_id]}) AS all_rings
+UNWIND all_rings AS ring
+WITH ring, all_rings
+WHERE none(o IN all_rings WHERE size(o.txns) > size(ring.txns) AND all(t IN ring.txns WHERE t IN o.txns))
+WITH ring.a AS a, ring.r0 AS r0, ring.p AS p, ring.e AS e, nodes(ring.p) + [ring.a] AS ns
+// identity evidence: the link that closes the loop, and members of different customers sharing an identity
+OPTIONAL MATCH link = (a)<-[:OWNS]-(:Customer)-[:HAS_CONTACT]->(k:Contact)<-[:HAS_CONTACT]-(:Customer)-[:OWNS]->(e)
+  WHERE e <> a AND k.kind IN ['phone','email']
+OPTIONAL MATCH dev = (c1:Customer)-[:OWNS]->(m1:Account)-[:USED_DEVICE]->(:Device)<-[:USED_DEVICE]-(m2:Account)<-[:OWNS]-(c2:Customer)
+  WHERE m1 IN ns AND m2 IN ns AND c1 <> c2 AND elementId(m1) < elementId(m2)
+OPTIONAL MATCH con = (m3:Account)<-[:OWNS]-(c3:Customer)-[:HAS_CONTACT]->(k2:Contact)<-[:HAS_CONTACT]-(c4:Customer)-[:OWNS]->(m4:Account)
+  WHERE k2.kind IN ['phone','email'] AND m3 IN ns AND m4 IN ns AND c3 <> c4 AND elementId(m3) < elementId(m4)
+WITH a, r0, p, e, collect(DISTINCT link) + collect(DISTINCT dev) + collect(DISTINCT con) AS evidence
+WHERE size(evidence) > 0
+RETURN a, r0, p, evidence;
