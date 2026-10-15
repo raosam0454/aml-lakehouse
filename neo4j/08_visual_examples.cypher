@@ -20,8 +20,9 @@ MATCH (d:Device)<-[:USED_DEVICE]-(a:Account)<-[:OWNS]-(c:Customer)
 WHERE c.onboard_dt >= date('2026-01-01') - duration('P150D')
 WITH d, collect(DISTINCT c) AS cs
 WHERE size(cs) >= 3
-WITH d LIMIT 1
-MATCH ring = (d)<-[:USED_DEVICE]-(:Account)<-[:OWNS]-(:Customer)
+WITH d, cs LIMIT 1
+MATCH ring = (d)<-[:USED_DEVICE]-(:Account)<-[:OWNS]-(c:Customer)
+WHERE c IN cs
 RETURN ring;
 
 // ---- (C) the same money cycle seen two ways: just one plain (medium) cycle
