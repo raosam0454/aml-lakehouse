@@ -1,16 +1,7 @@
 -- =====================================================================
---  alerts.sql  -  AML prototype, SERVING zone (Gold)
---
---  Implements:  "Alert generation" + "Serving views" boxes of the solution
---               architecture. Reads the detector tables built by
---               detection.sql and writes one alert per finding into
---               CURATED.FRAUD_ALERT. trigger_detail (VARIANT) carries the
---               evidence: path, transactions, tier, why it was flagged.
---
---  Re-runnable: FRAUD_ALERT is truncated first.
---  Run AFTER detection.sql. Never reads EVALUATION.GROUND_TRUTH.
---
---  fraud_score by tier: high = 90, medium = 60
+--  alerts.sql : one alert per detection into CURATED.FRAUD_ALERT,
+--  plus the dashboard views. Run after detection.sql.
+--  fraud_score: high = 90, medium = 60
 -- =====================================================================
 
 USE ROLE ACCOUNTADMIN;
@@ -31,7 +22,7 @@ SELECT 'ALT-' || LPAD(ROW_NUMBER() OVER (ORDER BY alert_type, account_id, transa
        'open',
        CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
 FROM (
-    -- round-trips: origin account, first transaction of the ring
+    -- round-trips
     SELECT origin                               AS account_id,
            txn_ids[0]::VARCHAR                  AS transaction_id,
            'round_trip'                         AS alert_type,
@@ -51,7 +42,7 @@ FROM (
 
     UNION ALL
 
-    -- layering chains: first account of the chain
+    -- layering chains
     SELECT origin,
            txn_ids[0]::VARCHAR,
            'layering_chain',
@@ -68,7 +59,7 @@ FROM (
 
     UNION ALL
 
-    -- mule rings: one alert per ring (network-level, no single transaction)
+    -- mule rings
     SELECT accounts[0]::VARCHAR,
            NULL,
            'mule_network',
@@ -79,14 +70,30 @@ FROM (
                'n_customers',  n_customers,
                'accounts',     accounts)
     FROM   SERVING.DET_MULE
+
+    UNION ALL
+
+    -- structuring
+    SELECT account_id,
+           txn_ids[0]::VARCHAR,
+           'structuring',
+           60,
+           OBJECT_CONSTRUCT(
+               'tier',         tier,
+               'n_days',       n_days,
+               'n_deposits',   n_deposits,
+               'total_amount', total_amount,
+               'n_branches',   n_branches,
+               'first_day',    first_day,
+               'last_day',     last_day,
+               'txn_ids',      txn_ids)
+    FROM   SERVING.DET_STRUCTURING
 );
 
 
--- ---------------------------------------------------------------------
--- Serving views for the dashboards
--- ---------------------------------------------------------------------
+-- Dashboard views
 
--- Dashboard 1: money rings (one row per ring)
+-- rings and layering chains
 CREATE OR REPLACE VIEW SERVING.V_DASH_RINGS AS
 SELECT alert_id,
        trigger_detail:tier::VARCHAR          AS tier,
@@ -99,7 +106,7 @@ SELECT alert_id,
 FROM   CURATED.FRAUD_ALERT
 WHERE  alert_type IN ('round_trip', 'layering_chain');
 
--- Dashboard 2: identity clusters (mule rings)
+-- mule rings
 CREATE OR REPLACE VIEW SERVING.V_DASH_MULE AS
 SELECT alert_id,
        trigger_detail:device_id::VARCHAR     AS device_id,
@@ -108,7 +115,7 @@ SELECT alert_id,
 FROM   CURATED.FRAUD_ALERT
 WHERE  alert_type = 'mule_network';
 
--- Dashboard 3: alert queue by type and tier
+-- alerts by type and tier
 CREATE OR REPLACE VIEW SERVING.V_DASH_ALERT_SUMMARY AS
 SELECT alert_type,
        trigger_detail:tier::VARCHAR AS tier,
