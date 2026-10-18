@@ -49,7 +49,6 @@ performance as hop depth increases, is measured rather than assumed.
                               ╚═══════════════════════════════╝
 ```
 
-Full diagrams in `docs/`.
 
 ### Schemas
 
