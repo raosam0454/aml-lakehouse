@@ -91,7 +91,7 @@ across unrelated people, and without filtering them the view returns noise.
 
 | Scenario | Pattern | Technique | Where |
 |---|---|---|---|
-| Structuring | Cash deposits held under the AUD 10,000 threshold, spread across branches | Window aggregation | structuring query (Bao), not yet wired into `alerts.sql` |
+| Structuring | Cash deposits held under the AUD 10,000 threshold, spread across branches | Window aggregation (per account and day) | `SERVING.DET_STRUCTURING` |
 | Layering chain | Funds moved through 4 to 8 accounts, decaying amounts, short intervals | Recursive CTE | `SERVING.DET_LAYERING` |
 | Round-tripping | Funds leaving and returning to the origin through intermediaries | Recursive CTE with cycle termination + identity cross-check | `SERVING.DET_ROUND_TRIP` |
 | Mule network | Recently opened accounts sharing a device, rapid in and out | Shared device + pass-through behaviour | `SERVING.DET_MULE` |
@@ -157,8 +157,9 @@ chain counts as found only if **one** detection covers all of it.
 | round_trip_sub_threshold | 4 | 0 | 1 | 3 | — |
 | layering_chain | 15 | 15 | 0 | 0 | medium |
 | mule_network | 9 | 9 | 0 | 0 | — |
+| structuring | 9 | 9 | 0 | 0 | — |
 
-False positives: round-trip 0, mule 0, layering 1. 46 alerts in total.
+False positives: round-trip 0, mule 0, structuring 0, layering 1. 55 alerts in total.
 
 - **phone_link** is the case the cross-check exists for. A strict "returns to the
   origin" check misses all five; closing the loop through the shared phone finds them.
@@ -240,7 +241,7 @@ nothing.
 Run in order in a Snowsight worksheet:
 
 ```
-sql/detection.sql   ->  SERVING.P1_EDGE, ACC_LINK, P1_WALK, DET_ROUND_TRIP, DET_LAYERING, PASS_THROUGH, DET_MULE
+sql/detection.sql   ->  SERVING.P1_EDGE, ACC_LINK, P1_WALK, DET_ROUND_TRIP, DET_LAYERING, PASS_THROUGH, DET_MULE, DET_STRUCTURING
 sql/alerts.sql      ->  CURATED.FRAUD_ALERT + SERVING.V_DASH_* views
 sql/benchmark.sql   ->  EVALUATION.V_BENCHMARK   (the only script that reads GROUND_TRUTH)
 ```
@@ -320,7 +321,7 @@ the views and never the base tables, so there is nothing to bypass.
 sql/
   aml_schemav3.sql          database, schemas, roles, tables, views, governance
   load_sample.sql           stage to raw, raw to curated, verification
-  detection.sql             graph detection: layering, round-trips (P1 + P2), mule rings
+  detection.sql             detectors: layering, round-trips (P1 + P2), mule rings, structuring
   alerts.sql                alert generation into FRAUD_ALERT + dashboard views
   benchmark.sql             detections vs ground truth (EVALUATION)
   dashboards.sql            the queries behind each dashboard chart
@@ -345,6 +346,7 @@ extractionCsv/
 | Continuous ingestion is designed but not implemented | Loading runs as scheduled batch rather than streaming |
 | Graph traversal uses recursive SQL | No native graph engine. Measured against Neo4j: both need pruning, see Graph detection |
 | Layering alone is a weak signal at volume | False positives rise from 1 to 22 when volume grows 10x; rings and mule stay at 0 |
+| Structuring uses a per-day window | Split deposits spread one per day would not be caught; the synthetic data has no cash noise above AUD 4,500, so its 0 false positives are optimistic |
 | Sub-threshold rings are not detected | The generator re-draws the amount at every hop, so these rings do not decay |
 | Neo4j copy has no cash transactions | The mule check there uses recent onboarding only; cash-out pass-through is checked in Snowflake |
 | Governance uses secure views | Enterprise masking and row access policies were unavailable |

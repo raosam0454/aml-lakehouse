@@ -1,31 +1,7 @@
 -- =====================================================================
---  detection.sql  -  AML prototype, SERVING zone (Gold)
---
---  Implements:  CURATED -> SERVING  "Detection" box of the solution
---               architecture. Graph traversal over the money-flow edge set
---               (CURATED.TRANSACTION) plus identity links (P2).
---
---  Builds (all re-runnable, CREATE OR REPLACE):
---    SERVING.P1_EDGE         money edges: completed transfers, owners differ
---    SERVING.ACC_LINK        strong identity links between accounts (P2):
---                            same phone / email (CUSTOMER) or same device (SESSION)
---    SERVING.P1_WALK         every time-ordered, decaying money path (recursive CTE)
---    SERVING.DET_ROUND_TRIP  P1 cycles, closed on the origin OR on an account
---                            linked to the origin (P2 closes the loop); tiered
---    SERVING.DET_LAYERING    P1 open chains of >= 4 hops (maximal only)
---    SERVING.PASS_THROUGH    accounts that receive money and send >=90% out in 24h
---    SERVING.DET_MULE        P2 mule rings: >=3 customers on one device, recent
---                            accounts, pass-through behaviour
---
---  Structuring (cash deposits under the TTR threshold) is a separate,
---  non-graph detector (window aggregation) - see BaoTest.sql.
---
---  Never reads EVALUATION.GROUND_TRUTH.
---
---  Thresholds (assumptions, tuned against ground truth, see benchmark.sql):
---    hop gap <= 48h, each hop 80-100% of the previous one, 3..8 hops,
---    pass-through = >=90% out within 24h, mule = >=3 customers per device,
---    account opened <= 150 days before the first transaction in the data.
+--  detection.sql : CURATED -> SERVING detectors
+--  Layering, round-trips (P1 money flow + P2 shared identity), mule rings,
+--  structuring. Run before alerts.sql.
 -- =====================================================================
 
 USE ROLE ACCOUNTADMIN;
@@ -34,12 +10,7 @@ USE DATABASE AML_PROTOTYPE;
 USE SCHEMA SERVING;
 
 
--- ---------------------------------------------------------------------
--- 1. Money edges. One edge per transaction (never aggregated), so every
---    hop keeps its own time and amount. Transfers between two accounts of
---    the same customer are excluded, otherwise savings -> offset looks
---    like a chain.
--- ---------------------------------------------------------------------
+-- 1. Money edges: one per completed transfer, excluding own-account transfers
 CREATE OR REPLACE TABLE P1_EDGE AS
 SELECT t.transaction_id,
        t.account_id              AS src,
@@ -54,12 +25,7 @@ WHERE  t.txn_type = 'transfer'
   AND  s.customer_id <> d.customer_id;
 
 
--- ---------------------------------------------------------------------
--- 2. Strong identity links between accounts of DIFFERENT customers (P2).
---    Both directions are stored (a->b and b->a) so lookups need one join.
---    IP and address are deliberately left out: shared wifi, carrier NAT
---    and shared buildings make them weak signals.
--- ---------------------------------------------------------------------
+-- 2. Identity links (P2): accounts of different customers sharing phone, email or device
 CREATE OR REPLACE TABLE ACC_LINK AS
 SELECT DISTINCT a1.account_id AS a, a2.account_id AS b, 'phone' AS via
 FROM   CURATED.ACCOUNT  a1
@@ -81,15 +47,7 @@ JOIN   CURATED.ACCOUNT y  ON y.account_id = s2.account_id
 WHERE  x.customer_id <> y.customer_id;
 
 
--- ---------------------------------------------------------------------
--- 3. Graph traversal (P1). Starts from every money edge and follows the
---    money one hop at a time. Pruning happens INSIDE the recursion, so the
---    number of paths stays small:
---      - next hop happens after the previous one, at most 48h later
---      - next amount is 80-100% of the previous amount (launderer's fee)
---      - an account is not revisited, except closing back on the origin
---      - at most 8 hops; a path stops once it is back at the origin
--- ---------------------------------------------------------------------
+-- 3. Money paths (P1): next hop within 48h, 80-100% of previous amount, max 8 hops
 CREATE OR REPLACE TABLE P1_WALK AS
 WITH RECURSIVE walk (origin, cur, last_time, last_amount, first_amount, hops, path, txn_ids) AS (
     SELECT e.src::VARCHAR,
@@ -126,14 +84,8 @@ SELECT walk.*,
 FROM   walk;
 
 
--- ---------------------------------------------------------------------
--- 4. Round-trips (P1 cycle detection + P2 cross-check).
---    A path is a cycle if it ends on the origin account, OR on an account
---    strongly linked to the origin (P2 closes the loop: money returned to
---    the launderer's other account / a relative's account).
---    Tier: high   = closed through a link, or two members share an identity
---          medium = cycle only
--- ---------------------------------------------------------------------
+-- 4. Round-trips: path returns to the origin or to an account linked to it.
+--    high = closed through a link or members share an identity, medium = cycle only
 CREATE OR REPLACE TABLE DET_ROUND_TRIP AS
 WITH candidate AS (
     SELECT w.*,
@@ -144,8 +96,7 @@ WITH candidate AS (
       AND  (w.cur = w.origin OR l.a IS NOT NULL)
     QUALIFY ROW_NUMBER() OVER (PARTITION BY w.path_key ORDER BY closed_by) = 1
 ),
--- keep maximal rings only: inside a ring whose members share a device, every
--- sub-path of >=3 hops also "closes" on a linked member; drop those subsets
+-- keep maximal rings only
 maximal AS (
     SELECT c.*
     FROM   candidate c
@@ -154,7 +105,7 @@ maximal AS (
           AND ARRAY_SIZE(ARRAY_INTERSECTION(b.txn_ids, c.txn_ids)) = ARRAY_SIZE(c.txn_ids)
     WHERE  b.path_key IS NULL
 ),
--- P2 inside the ring: pairs of members linked by phone / email / device
+-- linked member pairs inside each ring
 shared AS (
     SELECT m.path_key,
            COUNT(l.a)                                AS shared_pairs,
@@ -182,12 +133,7 @@ FROM   maximal m
 JOIN   shared s ON s.path_key = m.path_key;
 
 
--- ---------------------------------------------------------------------
--- 5. Layering (P1 open chains): >= 4 hops that do not close, keeping only
---    maximal chains (a chain is dropped if a longer path contains it), and
---    dropping paths already reported as a round-trip (a ring that closed
---    through a P2 link is an open path in P1_WALK and would be double-counted).
--- ---------------------------------------------------------------------
+-- 5. Layering: open paths of 4+ hops, maximal only, not part of a round-trip
 CREATE OR REPLACE TABLE DET_LAYERING AS
 WITH long_paths AS (
     SELECT * FROM P1_WALK WHERE hops >= 4
@@ -211,12 +157,8 @@ LEFT JOIN DET_ROUND_TRIP r
 WHERE  r.path_key IS NULL;
 
 
--- ---------------------------------------------------------------------
--- 6. Mule network (P2 + behaviour).
---    Shared device alone is too noisy (many devices are used by 2-3
---    customers legitimately), so a ring also needs recently opened
---    accounts that pass money straight through.
--- ---------------------------------------------------------------------
+-- 6. Mule rings: 3+ customers on one device, recently opened accounts that pass
+--    money through (>= 90% out within 24h)
 CREATE OR REPLACE TABLE PASS_THROUGH AS
 SELECT DISTINCT i.counterparty_account_id AS account_id
 FROM   CURATED.TRANSACTION i
@@ -247,13 +189,46 @@ GROUP BY device_id
 HAVING COUNT(DISTINCT customer_id) >= 3;
 
 
--- ---------------------------------------------------------------------
--- 7. Quick check (expected on generator seed 42 / small, 50,012 txns):
---    round-trips 19 (13 high, 6 medium), layering ~18, mule rings 9
--- ---------------------------------------------------------------------
-SELECT 'round_trip' AS detector, tier, COUNT(*) AS n FROM DET_ROUND_TRIP GROUP BY tier
+-- 7. Structuring: 2+ cash deposits under 10,000 on the same day totalling 10,000+
+--    (logic by Duy Bao Cao)
+CREATE OR REPLACE TABLE DET_STRUCTURING AS
+WITH deposits AS (
+    SELECT transaction_id,
+           counterparty_account_id AS account_id,
+           txn_time::DATE          AS day,
+           amount,
+           branch_code
+    FROM   CURATED.TRANSACTION
+    WHERE  txn_type = 'cash_deposit'
+      AND  status   = 'completed'
+      AND  amount BETWEEN 7000 AND 9999.99
+),
+flagged_days AS (
+    SELECT account_id, day
+    FROM   deposits
+    GROUP BY account_id, day
+    HAVING COUNT(*) >= 2 AND SUM(amount) >= 10000
+)
+SELECT d.account_id,
+       COUNT(DISTINCT d.day)            AS n_days,
+       COUNT(*)                         AS n_deposits,
+       SUM(d.amount)                    AS total_amount,
+       COUNT(DISTINCT d.branch_code)    AS n_branches,
+       MIN(d.day)                       AS first_day,
+       MAX(d.day)                       AS last_day,
+       ARRAY_AGG(d.transaction_id)      AS txn_ids,
+       'medium'                         AS tier
+FROM   deposits d
+JOIN   flagged_days f ON f.account_id = d.account_id AND f.day = d.day
+GROUP BY d.account_id;
+
+
+-- 8. Detections per detector and tier
+SELECT 'round_trip' AS detector, tier, COUNT(*) AS n FROM DET_ROUND_TRIP  GROUP BY tier
 UNION ALL
-SELECT 'layering',   tier, COUNT(*) FROM DET_LAYERING  GROUP BY tier
+SELECT 'layering',    tier, COUNT(*) FROM DET_LAYERING    GROUP BY tier
 UNION ALL
-SELECT 'mule',       tier, COUNT(*) FROM DET_MULE      GROUP BY tier
+SELECT 'mule',        tier, COUNT(*) FROM DET_MULE        GROUP BY tier
+UNION ALL
+SELECT 'structuring', tier, COUNT(*) FROM DET_STRUCTURING GROUP BY tier
 ORDER BY detector, tier;
