@@ -235,19 +235,7 @@ check is handled: if JSON nulls arrive as the string `"null"`, cash
 deposits lose their null originator and structuring detection silently returns
 nothing.
 
-### 4. Automate
-
-`sql/pipeline.sql` wraps the load in two stored procedures driven by a task
-DAG:
-
-```
-T_LOAD_RAW ──► T_LOAD_CURATED
-```
-
-Run it on demand with `EXECUTE TASK RAW.T_LOAD_RAW;` to rebuild all tables from
-the staged files in one statement.
-
-### 5. Detect, alert, evaluate
+### 4. Detect, alert, evaluate
 
 Run in order in a Snowsight worksheet:
 
@@ -257,7 +245,7 @@ sql/alerts.sql      ->  CURATED.FRAUD_ALERT + SERVING.V_DASH_* views
 sql/benchmark.sql   ->  EVALUATION.V_BENCHMARK   (the only script that reads GROUND_TRUTH)
 ```
 
-### 6. Dashboards
+### 5. Dashboards
 
 Snowsight Dashboards are deprecated and new ones can no longer be created, so the
 dashboards are a Streamlit in Snowflake app: Projects → Streamlit → + Streamlit App
